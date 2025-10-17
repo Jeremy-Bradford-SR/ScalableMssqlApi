@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  p2c:
+    build: .
+    ports:
+      - "8083:8083"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8083
+    restart: always
