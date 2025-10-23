@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Caching.Memory;
 using System.Data;
 using System.Data.SqlClient;
 
@@ -9,13 +8,11 @@ namespace ScalableMssqlApi.Controllers
     [Route("api/[controller]")]
     public class DataController : ControllerBase
     {
-        private readonly IMemoryCache _cache;
         private readonly IConfiguration _config;
         private readonly string _connectionString;
 
-        public DataController(IMemoryCache cache, IConfiguration config)
+        public DataController(IConfiguration config)
         {
-            _cache = cache;
             _config = config;
             _connectionString = _config.GetConnectionString("Default") ?? throw new InvalidOperationException("Missing connection string.");
         }
@@ -83,7 +80,7 @@ namespace ScalableMssqlApi.Controllers
         [HttpGet("tables")]
         public async Task<IActionResult> GetTables()
         {
-            var tables = new List<string>();
+            var tableList = new List<string>();
             using var conn = new SqlConnection(_connectionString);
             await conn.OpenAsync();
 
@@ -96,13 +93,13 @@ namespace ScalableMssqlApi.Controllers
 
             using var reader = await cmd.ExecuteReaderAsync();
             while (await reader.ReadAsync())
-                tables.Add(reader.GetString(0));
+                tableList.Add(reader.GetString(0));
 
-            return Ok(tables);
+            return Ok(tableList);
         }
 
         [HttpGet("schema")]
-        public async Task<IActionResult> GetSchema([FromQuery] string table)
+        public async Task<IActionResult> GetSchema([FromQuery] string table) // Note: table name is case-sensitive for cache key
         {
             if (string.IsNullOrWhiteSpace(table))
                 return BadRequest("Missing table name.");
@@ -116,20 +113,17 @@ namespace ScalableMssqlApi.Controllers
             using var reader = await cmd.ExecuteReaderAsync();
             var schema = reader.GetSchemaTable();
 
-            var columns = new List<object>();
+            var columnList = new List<object>();
             foreach (DataRow row in schema.Rows)
             {
-                columns.Add(new {
-                    ColumnName = row["ColumnName"],
-                    DataType = row["DataTypeName"],
-                    AllowDBNull = row["AllowDBNull"],
-                    IsIdentity = row["IsIdentity"],
-                    IsKey = row["IsKey"],
+                columnList.Add(new {
+                    ColumnName = row["ColumnName"], DataType = row["DataTypeName"], AllowDBNull = row["AllowDBNull"],
+                    IsIdentity = row["IsIdentity"], IsKey = row["IsKey"],
                     Skippable = IsSkippableType(row["DataTypeName"]?.ToString())
                 });
             }
 
-            return Ok(columns);
+            return Ok(columnList);
         }
 
         private static bool IsSkippableType(string? typeName) =>

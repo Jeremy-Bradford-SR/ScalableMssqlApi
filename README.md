@@ -37,7 +37,7 @@ The app reads the ADO.NET connection string named `Default` from the standard .N
 ```json
 {
   "ConnectionStrings": {
-    "Default": "Server=192.168.0.43;Database=p2cdubuque;User Id=sa;Password=Thugitout09!;TrustServerCertificate=true;Max Pool Size=100;"
+    "Default": "Server=your_server;Database=your_db;User Id=your_user;Password=your_password;TrustServerCertificate=true;Max Pool Size=100;"
   }
 }
 ```
