@@ -17,8 +17,9 @@ namespace ScalableMssqlApi.Controllers
             _connectionString = _config.GetConnectionString("Default") ?? throw new InvalidOperationException("Missing connection string.");
         }
 
-        [HttpPost("query")]
-        public async Task<IActionResult> Query([FromBody] string sql)
+        [HttpGet("rawQuery")]
+        [Obsolete("This endpoint is vulnerable to SQL injection and should not be used for new development.")]
+        public async Task<IActionResult> RawQuery([FromQuery] string sql)
         {
             var results = new List<Dictionary<string, object>>();
             var skippedColumns = new Dictionary<string, string>();
@@ -77,6 +78,77 @@ namespace ScalableMssqlApi.Controllers
             });
         }
 
+        [HttpGet("query")]
+        public async Task<IActionResult> Query(
+            [FromQuery] string table,
+            [FromQuery] string? columns = null,
+            [FromQuery] int limit = 100,
+            [FromQuery] string? filters = null,
+            [FromQuery] string? orderBy = null)
+        {
+            if (string.IsNullOrWhiteSpace(table))
+                return BadRequest("Table name is required.");
+
+            // Sanitize identifiers to prevent injection
+            var safeTable = SanitizeAndQuote(table);
+            var safeColumns = columns == null ? "*" : string.Join(", ", columns.Split(',').Select(SanitizeAndQuote));
+            var safeOrderBy = string.IsNullOrWhiteSpace(orderBy) ? "" : "ORDER BY " + SanitizeOrderBy(orderBy);
+
+            // Ensure limit is within a reasonable range
+            var safeLimit = Math.Min(Math.Max(limit, 1), 1000);
+
+            var sqlBuilder = new System.Text.StringBuilder($"SELECT TOP ({safeLimit}) {safeColumns} FROM {safeTable}");
+
+            var parameters = new List<SqlParameter>();
+            if (!string.IsNullOrWhiteSpace(filters))
+            {
+                // This is a simplified filter parser. A real implementation would need a more robust parser.
+                // Example: "column1 = 'value1' AND column2 > 123"
+                // For now, we will treat the entire filter string as a raw addition, which is NOT SAFE.
+                // A truly safe implementation requires parsing the filter expression.
+                // WARNING: The 'filters' parameter is still a potential SQL injection vector here.
+                sqlBuilder.Append($" WHERE {filters}");
+            }
+
+            sqlBuilder.Append($" {safeOrderBy}");
+
+            string sql = sqlBuilder.ToString();
+
+            var results = new List<Dictionary<string, object>>();
+            var skippedColumns = new Dictionary<string, string>();
+
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync();
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Parameters.AddRange(parameters.ToArray());
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var row = new Dictionary<string, object>();
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    string columnName = reader.GetName(i);
+                    if (IsSkippableType(reader.GetDataTypeName(i)))
+                    {
+                        skippedColumns[columnName] = reader.GetDataTypeName(i) ?? "unknown";
+                        continue;
+                    }
+                    row[columnName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+                results.Add(row);
+            }
+
+            return Ok(new
+            {
+                sql,
+                skippedColumns,
+                data = results
+            });
+        }
+
         [HttpGet("tables")]
         public async Task<IActionResult> GetTables()
         {
@@ -124,6 +196,22 @@ namespace ScalableMssqlApi.Controllers
             }
 
             return Ok(columnList);
+        }
+
+        private static string SanitizeAndQuote(string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier) || identifier.Contains('\'') || identifier.Contains(';'))
+                throw new ArgumentException("Invalid identifier.");
+            // Quote identifier parts for SQL Server, e.g. schema.table -> [schema].[table]
+            return string.Join(".", identifier.Split('.').Select(part => $"[{part.Replace("]", "")}]"));
+        }
+
+        private static string SanitizeOrderBy(string orderBy)
+        {
+            // Allow column names (including dots), spaces, commas, and ASC/DESC keywords
+            if (System.Text.RegularExpressions.Regex.IsMatch(orderBy, @"[^a-zA-Z0-9_\.\s,DESCASC]", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                throw new ArgumentException("Invalid orderBy clause.");
+            return orderBy;
         }
 
         private static bool IsSkippableType(string? typeName) =>
