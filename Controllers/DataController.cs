@@ -61,7 +61,22 @@ namespace ScalableMssqlApi.Controllers
 
                     try
                     {
-                        row[columnName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        if (reader.IsDBNull(i))
+                        {
+                            row[columnName] = null;
+                        }
+                        else
+                        {
+                            var val = reader.GetValue(i);
+                            if (val is byte[] bytes)
+                            {
+                                row[columnName] = Convert.ToBase64String(bytes);
+                            }
+                            else
+                            {
+                                row[columnName] = val;
+                            }
+                        }
                     }
                     catch
                     {
@@ -136,7 +151,23 @@ namespace ScalableMssqlApi.Controllers
                         skippedColumns[columnName] = reader.GetDataTypeName(i) ?? "unknown";
                         continue;
                     }
-                    row[columnName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    
+                    if (reader.IsDBNull(i))
+                    {
+                        row[columnName] = null;
+                    }
+                    else
+                    {
+                        var val = reader.GetValue(i);
+                        if (val is byte[] bytes)
+                        {
+                            row[columnName] = Convert.ToBase64String(bytes);
+                        }
+                        else
+                        {
+                            row[columnName] = val;
+                        }
+                    }
                 }
                 results.Add(row);
             }
@@ -218,9 +249,6 @@ namespace ScalableMssqlApi.Controllers
             typeName != null && (
                 typeName.Contains("geography", StringComparison.OrdinalIgnoreCase) ||
                 typeName.Contains("geometry", StringComparison.OrdinalIgnoreCase) ||
-                typeName.Contains("hierarchyid", StringComparison.OrdinalIgnoreCase) ||
-                typeName.Contains("image", StringComparison.OrdinalIgnoreCase) ||
-                typeName.Contains("varbinary", StringComparison.OrdinalIgnoreCase) ||
-                typeName.Contains("binary", StringComparison.OrdinalIgnoreCase));
+                typeName.Contains("hierarchyid", StringComparison.OrdinalIgnoreCase));
     }
 }
