@@ -103,3 +103,20 @@ Example response:
 ```
 
 Security note: This endpoint executes raw SQL and is intended for internal tooling or admin use only. Do not expose it without authentication and authorization. Consider restricting the allowed SQL commands or using parameterized stored procedures for production scenarios.
+
+## GET /api/data/incidents
+Unified endpoint for fetching combined safety data (CAD, Arrests, Crimes) with time range filtering.
+- **Parameters**: `cadLimit`, `arrestLimit`, `crimeLimit`, `dateFrom` (YYYY-MM-DD HH:MM:SS), `dateTo`.
+- **Response**: `{ data: [ { ...rec, _source: 'cadHandler'|'DailyBulletinArrests' } ] }`
+
+## GET /api/data/sex-offenders
+Fetches the registry of Sex Offenders.
+- **Optimized**: Does **not** return `photo_data` (Base64 images) to ensure fast list loading. Images must be fetched individually or via `photo_url`.
+- **Parameters**: `page`, `limit`.
+- **Response**: `{ data: [ { registrant_id, first_name, ... } ] }`
+
+## GET /api/data/search360
+Performs a global text search across Arrests, Citations, Accidents, Crimes, and Sex Offenders.
+- **Parameters**: `q` (search term), `page`, `limit`.
+- **Response**: `{ data: [ { type: 'ARREST'|'CITATION'|..., name, details, ... } ] }`
+

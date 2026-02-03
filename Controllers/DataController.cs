@@ -119,7 +119,6 @@ namespace ScalableMssqlApi.Controllers
                   lat,
                   lon,
                   photo_url,
-                  photo_data,
                   tier,
                   gender,
                   race,
