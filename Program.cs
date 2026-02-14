@@ -15,9 +15,23 @@ builder.Services.AddSwaggerGen(c =>
     var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
     c.IncludeXmlComments(xmlPath);
 });
+builder.Services.AddScoped<ScalableMssqlApi.Services.Interfaces.IIngestionService, ScalableMssqlApi.Services.IngestionService>();
+builder.Services.AddScoped<ScalableMssqlApi.Services.Interfaces.IDataService, ScalableMssqlApi.Services.DataService>();
 
-// Force Kestrel to bind to port 8083
-builder.WebHost.UseUrls("http://*:8083");
+// Add CORS
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll",
+        builder =>
+        {
+            builder.AllowAnyOrigin()
+                   .AllowAnyMethod()
+                   .AllowAnyHeader();
+        });
+});
+
+// Add Health Checks
+builder.Services.AddHealthChecks();
 
 var app = builder.Build();
 
@@ -29,8 +43,14 @@ app.UseSwaggerUI(c =>
     c.RoutePrefix = string.Empty; // Serve Swagger UI at root
 });
 
-app.UseAuthorization();
+app.UseCors("AllowAll");
+
+// Register API Key Middleware
+app.UseMiddleware<ScalableMssqlApi.Middleware.ApiKeyMiddleware>();
+
+
 app.MapControllers();
+app.MapHealthChecks("/health");
 
 try
 {
