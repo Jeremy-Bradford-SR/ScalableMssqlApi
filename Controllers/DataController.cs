@@ -95,30 +95,106 @@ namespace ScalableMssqlApi.Controllers
         public async Task<IActionResult> GetCorrections([FromQuery] int page = 1, [FromQuery] int limit = 50)
         {
             var offset = (page - 1) * limit;
-            var sql = @"
-                SELECT 
-                  S.OffenderNumber,
-                  S.Name,
-                  S.Gender,
-                  S.Age,
-                  S.DateScraped,
-                  MAX(D.Location) as Location, 
-                  MAX(D.Offense) as Offense,   
-                  MAX(D.CommitmentDate) as CommitmentDate,
-                  MAX(D.TDD_SDD) as TDD_SDD,
-                  
-                  STRING_AGG(CONCAT(C.SupervisionStatus, ' (', C.OffenseClass, ')'), ', ') as SupervisionStatus,
-                  STRING_AGG(C.OffenseClass, ', ') as OffenseClass,
-                  MAX(C.CountyOfCommitment) as CountyOfCommitment,
-                  MAX(C.EndDate) as EndDate
-                FROM dbo.Offender_Summary AS S
-                LEFT JOIN dbo.Offender_Detail AS D ON S.OffenderNumber = D.OffenderNumber
-                LEFT JOIN dbo.Offender_Charges AS C ON S.OffenderNumber = C.OffenderNumber
-                GROUP BY S.OffenderNumber, S.Name, S.Gender, S.Age, S.DateScraped
-                ORDER BY S.DateScraped DESC
-                OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
             
-            return await ExecuteSafeQuery(sql, new Dictionary<string, object> { { "@Offset", offset }, { "@Limit", limit } });
+            // 1. Fetch Summary IDs (Base Page)
+            var baseSql = @"
+                SELECT OffenderNumber, Name, Gender, Age, DateScraped
+                FROM dbo.Offender_Summary
+                ORDER BY DateScraped DESC
+                OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
+
+            var summaries = new List<Dictionary<string, object>>();
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync();
+            
+            // Fetch Base
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = baseSql;
+                cmd.Parameters.AddWithValue("@Offset", offset);
+                cmd.Parameters.AddWithValue("@Limit", limit);
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    var row = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                    summaries.Add(row);
+                }
+            }
+
+            if (summaries.Count == 0) return Ok(new { data = summaries });
+
+            // 2. Fetch Details for these IDs using simple string aggregation for IN clause (safe for ints/guids, sanitize strings)
+            var ids = summaries.Select(s => s["OffenderNumber"].ToString()).Distinct().ToList();
+            var idList = string.Join("','", ids.Select(id => id.Replace("'", "''"))); 
+            
+            var detailSql = $@"
+                SELECT OffenderNumber, Location, Offense, CommitmentDate, TDD_SDD
+                FROM dbo.Offender_Detail
+                WHERE OffenderNumber IN ('{idList}')";
+            
+            var chargeSql = $@"
+                SELECT OffenderNumber, SupervisionStatus, OffenseClass, CountyOfCommitment, EndDate
+                FROM dbo.Offender_Charges
+                WHERE OffenderNumber IN ('{idList}')";
+
+            var details = new Dictionary<string, Dictionary<string, object>>();
+            var charges = new Dictionary<string, List<Dictionary<string, object>>>();
+
+            // Fetch Details
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = detailSql;
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    var oid = reader["OffenderNumber"].ToString();
+                    var row = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                    if (!details.ContainsKey(oid)) details[oid] = row;
+                }
+            }
+
+            // Fetch Charges
+            using (var cmd = conn.CreateCommand())
+            {
+               cmd.CommandText = chargeSql;
+               using var reader = await cmd.ExecuteReaderAsync();
+               while (await reader.ReadAsync())
+               {
+                   var oid = reader["OffenderNumber"].ToString();
+                   var row = new Dictionary<string, object>();
+                   for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                   if (!charges.ContainsKey(oid)) charges[oid] = new List<Dictionary<string, object>>();
+                   charges[oid].Add(row);
+               }
+            }
+
+            // Merge
+            foreach (var s in summaries)
+            {
+                var oid = s["OffenderNumber"].ToString();
+                
+                // Merge Detail
+                if (details.TryGetValue(oid, out var d))
+                {
+                    s["Location"] = d.ContainsKey("Location") ? d["Location"] : null;
+                    s["Offense"] = d.ContainsKey("Offense") ? d["Offense"] : null;
+                    s["CommitmentDate"] = d.ContainsKey("CommitmentDate") ? d["CommitmentDate"] : null;
+                    s["TDD_SDD"] = d.ContainsKey("TDD_SDD") ? d["TDD_SDD"] : null;
+                }
+
+                // Merge Charges (Aggregate)
+                if (charges.TryGetValue(oid, out var cList))
+                {
+                   s["SupervisionStatus"] = string.Join(", ", cList.Select(c => $"{c["SupervisionStatus"]} ({c["OffenseClass"]})"));
+                   s["OffenseClass"] = string.Join(", ", cList.Select(c => c["OffenseClass"]).Distinct());
+                   s["CountyOfCommitment"] = cList.FirstOrDefault()?.GetValueOrDefault("CountyOfCommitment");
+                   s["EndDate"] = cList.Max(c => c.ContainsKey("EndDate") ? c["EndDate"] as DateTime? : null);
+                }
+            }
+
+            return Ok(new { data = summaries });
         }
 
         [HttpGet("dispatch")]
@@ -448,23 +524,84 @@ namespace ScalableMssqlApi.Controllers
             var where = "1=1";
             var parameters = new Dictionary<string, object> { { "@Limit", limit }, { "@Offset", offset } };
 
-            if (activeOnly) where += " AND i.released_date IS NULL";
+            if (activeOnly) where += " AND released_date IS NULL";
             if (!string.IsNullOrWhiteSpace(search)) {
-                where += " AND (i.lastname LIKE @Search OR i.firstname LIKE @Search OR i.invid LIKE @Search)";
+                where += " AND (lastname LIKE @Search OR firstname LIKE @Search OR invid LIKE @Search)";
                 parameters.Add("@Search", "%" + search + "%");
             }
 
+            // 1. Fetch Inmates
             var sql = $@"
                 SELECT 
-                  i.book_id, i.invid, i.firstname, i.lastname, i.dob, i.arrest_date, i.released_date,
-                  i.age, i.race, i.sex, i.total_bond_amount, i.next_court_date,
-                  (SELECT STRING_AGG(charge_description, ', ') WITHIN GROUP (ORDER BY charge_description) FROM jail_charges WHERE book_id = i.book_id) as charges
-                FROM jail_inmates i 
+                  book_id, invid, firstname, lastname, dob, arrest_date, released_date,
+                  age, race, sex, total_bond_amount, next_court_date
+                FROM jail_inmates 
                 WHERE {where}
-                ORDER BY i.arrest_date DESC
+                ORDER BY arrest_date DESC
                 OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
 
-            return await ExecuteSafeQuery(sql, parameters);
+            var inmates = new List<Dictionary<string, object>>();
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync();
+            
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                foreach(var p in parameters) cmd.Parameters.AddWithValue(p.Key, p.Value);
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    var row = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                    inmates.Add(row);
+                }
+            }
+
+            if (inmates.Count == 0) return Ok(new { data = inmates });
+
+            // 2. Fetch Charges for these BookIDs
+            var bookIds = inmates.Select(i => i["book_id"].ToString()).Distinct().ToList();
+            var idList = string.Join("','", bookIds.Select(id => id.Replace("'", "''"))); // Safety
+
+            var chargesSql = $@"
+                SELECT book_id, charge_description 
+                FROM jail_charges 
+                WHERE book_id IN ('{idList}')
+                ORDER BY charge_description"; // Order for consistency
+
+            var charges = new Dictionary<string, List<string>>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = chargesSql;
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                   var bid = reader["book_id"].ToString();
+                   var desc = reader["charge_description"]?.ToString();
+                   if (!string.IsNullOrEmpty(desc))
+                   {
+                       if (!charges.ContainsKey(bid)) charges[bid] = new List<string>();
+                       charges[bid].Add(desc);
+                   }
+                }
+            }
+
+            // 3. Merge
+            foreach (var img in inmates)
+            {
+                var bid = img["book_id"].ToString();
+                if (charges.TryGetValue(bid, out var cList))
+                {
+                    img["charges"] = string.Join(", ", cList);
+                }
+                else
+                {
+                    img["charges"] = "";
+                }
+            }
+
+            return Ok(new { data = inmates });
         }
 
         [HttpGet("jail/inmates/{bookId}/image")]
@@ -572,15 +709,15 @@ namespace ScalableMssqlApi.Controllers
 
              // 3. Charges
              cmd.CommandText = "SELECT ChargeID, OffenderNumber, SupervisionStatus, OffenseClass, CountyOfCommitment, EndDate FROM dbo.Offender_Charges WHERE OffenderNumber = @Num ORDER BY EndDate DESC";
-             var charges = new List<Dictionary<string, object>>();
+             var chargesList = new List<Dictionary<string, object>>();
              using (var r = await cmd.ExecuteReaderAsync()) {
                  while (await r.ReadAsync()) {
                      var row = new Dictionary<string, object>();
                      for(int i=0; i<r.FieldCount; i++) row[r.GetName(i)] = r.GetValue(i);
-                     charges.Add(row);
+                     chargesList.Add(row);
                  }
              }
-             finalRes["charges"] = charges;
+             finalRes["charges"] = chargesList;
 
              return Ok(new { data = finalRes });
         }
@@ -606,19 +743,8 @@ namespace ScalableMssqlApi.Controllers
         [HttpGet("proximity")]
         public async Task<IActionResult> GetProximity([FromQuery] string address, [FromQuery] double? lat = null, [FromQuery] double? lon = null, [FromQuery] int days = 7, [FromQuery] int distance = 1000, [FromQuery] string? nature = null)
         {
-             // Proximity logic usually requires geocoding on server or client. 
-             // Updated logic: client/proxy passes lat/lon. If not, we might fail or rely on basic address match?
-             // The proxy currently geocodes. We can accept geocoded coords.
-             
              if (!lat.HasValue || !lon.HasValue) return BadRequest("Lat/Lon required for proximity search (geocoding must be done by caller)");
 
-             // Using basic Euclidean distance on likely projected coords (IA State Plane) passed by proxy?
-             // Actually, the proxy converts to IA State Plane (EPSG:2235) for the SQL query.
-             // Let's assume the params passed ARE the projected X/Y (geox/geoy) or we handle the math?
-             // The SQL below expects geox/geoy in the DB are comparable to input.
-             
-             // Let's accept 'geox' and 'geoy' explicitly to be clear they are projected
-             
              var sql = $@"
                SELECT TOP 50 id, starttime, closetime, agency, service, nature, address, geox, geoy,
                  SQRT(POWER(CAST(geox AS FLOAT) - @X, 2) + POWER(CAST(geoy AS FLOAT) - @Y, 2)) AS distance_ft
@@ -629,8 +755,8 @@ namespace ScalableMssqlApi.Controllers
              sql += " ORDER BY starttime DESC, distance_ft ASC";
 
              var parameters = new Dictionary<string, object> { 
-                 { "@X", lat.Value }, // mapping lat param to X (caller must pass correct projected X)
-                 { "@Y", lon.Value }, // mapping lon param to Y
+                 { "@X", lat.Value },
+                 { "@Y", lon.Value },
                  { "@Dist", distance },
                  { "@StartDate", DateTime.Now.AddDays(-days) }
              };
@@ -642,7 +768,6 @@ namespace ScalableMssqlApi.Controllers
         [HttpGet("premise-history")]
         public async Task<IActionResult> GetPremiseHistory([FromQuery] string address)
         {
-             // Strict address match on vw_AllEvents
              var sql = "SELECT TOP 50 id, event_time, charge, name, location, [key], SourceType FROM vw_AllEvents WHERE Location = @Address ORDER BY event_time DESC";
              return await ExecuteSafeQuery(sql, new Dictionary<string, object> { { "@Address", address } });
         }
@@ -675,11 +800,6 @@ namespace ScalableMssqlApi.Controllers
              }
         }
 
-
-
-
-
         // Endpoints removed for security hardening: GetTables, GetSchema, Insert.
     }
 }
-
