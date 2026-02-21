@@ -37,10 +37,8 @@ namespace ScalableMssqlApi.Services
             int skipped = 0;
 
             // 1. Pre-process incoming data
-            // Strategy: Fetch existing records based on ID + Key combination to detect exact duplicates.
-            // We do NOT rename IDs anymore. If (ID, Key) exists, we check if it's the same record.
-            
-            var compositeKeys = reports.Select(r => new { r.id, r.key }).Distinct().ToList();
+            // Since DTO.id now reliably contains the computed MD5 (row_hash) and serves as the absolute PK, we only need to query on it.
+            var incomingRowHashes = reports.Select(r => r.id).Distinct().ToList();
             
             using var conn = new SqlConnection(_connectionString);
             await conn.OpenAsync();
@@ -48,69 +46,27 @@ namespace ScalableMssqlApi.Services
 
             try 
             {
-                // Fetch existing records for collision detection
-                // We fetch specific columns to compare content. 
-                // Since we can't easily pass a list of composite keys to SQL without a TVP or complex query construction,
-                // and fetching ALL by ID might be too much if IDs are reused broadly (though likely not THAT broadly),
-                // we'll fetch by ID IN (...) and then filter in memory by Key.
-                // This is a reasonable compromise if the number of distinct IDs in a batch isn't massive.
-                
-                var distinctIds = compositeKeys.Select(k => k.id).Distinct().ToList();
-
-                var existingRecords = (await conn.QueryAsync<dynamic>(
-                    "SELECT id, [key], name, [time] FROM DailyBulletinArrests WHERE id IN @ids", 
-                    new { ids = distinctIds }, 
+                var existingHashes = (await conn.QueryAsync<string>(
+                    "SELECT row_hash FROM DailyBulletinArrests WHERE row_hash IN @ids", 
+                    new { ids = incomingRowHashes }, 
                     transaction: tran
-                )).ToList(); // List of dynamic objects
-
-                // Create a lookup for (id, key) -> list of records (technically should be 1 if constraint exists, but let's be safe)
-                var existingLookup = existingRecords
-                    .GroupBy(x => new { Id = (string)x.id, Key = (string)x.key })
-                    .ToDictionary(g => g.Key, g => g.First());
+                )).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
                 var toInsert = new List<DailyBulletinDto>();
 
                 foreach (var r in reports)
                 {
-                    bool isDuplicate = false;
-                    var lookupKey = new { Id = r.id, Key = r.key };
+                    var incomingHash = r.id?.Trim().ToUpper() ?? "";
 
-                    if (existingLookup.TryGetValue(lookupKey, out var existing))
+                    if (existingHashes.Contains(incomingHash))
                     {
-                         // Record with same ID and Key exists. 
-                         // Check if content matches (True Duplicate) or if it's a constraint violation we should skip?
-                         // If it exists, we generally assume it's already ingested. 
-                         // We can check IsSame to be sure, but if the ID+Key matches, we can't insert it anyway due to the UNIQUE constraint.
-                         // So effectively, if ID+Key exists, we skip.
-                         isDuplicate = true;
-                         
-                         // Optional: Log if content is different? 
-                         // For now, simple skip logic as per "detect duplicates".
-                    }
-
-                    if (isDuplicate) {
-                        skipped++;
-                    } else {
+                         skipped++;
+                    } 
+                    else 
+                    {
                         toInsert.Add(r);
                         insertedIds.Add(r.id);
-                        // Add to lookup to prevent self-collisions within the batch
-                        try {
-                            // We need to match the dynamic structure expected by IsSame: name, time, key (strings)
-                            // We use an anonymous type which Dapper dynamic interaction should handle if we cast or just use object.
-                            // Accessing it via `dynamic` later in TryGetValue -> out existing -> IsSame(existing...) works if properties exist.
-                            
-                            dynamic newRecord = new System.Dynamic.ExpandoObject();
-                            ((IDictionary<string, object>)newRecord)["name"] = r.name;
-                            ((IDictionary<string, object>)newRecord)["time"] = r.time;
-                            ((IDictionary<string, object>)newRecord)["key"] = r.key;
-                            ((IDictionary<string, object>)newRecord)["id"] = r.id;
-
-                            if (!existingLookup.ContainsKey(lookupKey)) {
-                                existingLookup.Add(lookupKey, newRecord);
-                            }
-                        } catch (Exception ex) {
-                            _logger.LogWarning(ex, "Failed to update lookup for in-batch duplication check");
-                        }
+                        existingHashes.Add(incomingHash); // prevent in-batch dupes
                     }
                 }
 
@@ -118,10 +74,11 @@ namespace ScalableMssqlApi.Services
                 if (toInsert.Any())
                 {
                     var dataTable = new DataTable();
+                    dataTable.Columns.Add("row_hash", typeof(string));
+                    dataTable.Columns.Add("site_id", typeof(string));
                     dataTable.Columns.Add("invid", typeof(string));
                     dataTable.Columns.Add("key", typeof(string));
                     dataTable.Columns.Add("location", typeof(string));
-                    dataTable.Columns.Add("id", typeof(string));
                     dataTable.Columns.Add("name", typeof(string));
                     dataTable.Columns.Add("crime", typeof(string));
                     dataTable.Columns.Add("time", typeof(string));
@@ -141,10 +98,28 @@ namespace ScalableMssqlApi.Services
 
                     foreach (var item in toInsert)
                     {
+                        string safeHash = item.id?.Length > 50 ? item.id.Substring(0, 50) : item.id;
+                        string safeSiteId = item.site_id?.Length > 50 ? item.site_id.Substring(0, 50) : item.site_id;
+                        string safeKey = item.key?.Length > 50 ? item.key.Substring(0, 50) : item.key;
+                        string safeLocation = item.location?.Length > 500 ? item.location.Substring(0, 500) : item.location;
+                        string safeName = item.name?.Length > 255 ? item.name.Substring(0, 255) : item.name;
+                        string safeCrime = item.crime?.Length > 500 ? item.crime.Substring(0, 500) : item.crime;
+                        string safeTime = item.time?.Length > 100 ? item.time.Substring(0, 100) : item.time;
+                        string safeProperty = item.property?.Length > 255 ? item.property.Substring(0, 255) : item.property;
+                        string safeOfficer = item.officer?.Length > 255 ? item.officer.Substring(0, 255) : item.officer;
+                        string safeCase = item.@case?.Length > 1500 ? item.@case.Substring(0, 1500) : item.@case;
+                        string safeDescription = item.description?.Length > 1000 ? item.description.Substring(0, 1000) : item.description;
+                        string safeRace = item.race?.Length > 100 ? item.race.Substring(0, 100) : item.race;
+                        string safeSex = item.sex?.Length > 50 ? item.sex.Substring(0, 50) : item.sex;
+                        string safeLastName = item.lastname?.Length > 100 ? item.lastname.Substring(0, 100) : item.lastname;
+                        string safeFirstName = item.firstname?.Length > 100 ? item.firstname.Substring(0, 100) : item.firstname;
+                        string safeCharge = item.charge?.Length > 500 ? item.charge.Substring(0, 500) : item.charge;
+                        string safeMiddleName = item.middlename?.Length > 100 ? item.middlename.Substring(0, 100) : item.middlename;
+
                         dataTable.Rows.Add(
-                            item.invid, item.key, item.location, item.id, item.name, item.crime, 
-                            item.time, item.property, item.officer, item.@case, item.description, 
-                            item.race, item.sex, item.lastname, item.firstname, item.charge, item.middlename
+                            safeHash, safeSiteId, item.invid, safeKey, safeLocation, safeName, safeCrime, 
+                            safeTime, safeProperty, safeOfficer, safeCase, safeDescription, 
+                            safeRace, safeSex, safeLastName, safeFirstName, safeCharge, safeMiddleName
                         );
                     }
 

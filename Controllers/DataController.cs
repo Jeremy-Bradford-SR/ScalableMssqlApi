@@ -99,7 +99,7 @@ namespace ScalableMssqlApi.Controllers
             // 1. Fetch Summary IDs (Base Page)
             var baseSql = @"
                 SELECT OffenderNumber, Name, Gender, Age, DateScraped
-                FROM dbo.Offender_Summary
+                FROM dbo.Offender_Summary WITH (NOLOCK)
                 ORDER BY DateScraped DESC
                 OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
 
@@ -117,7 +117,12 @@ namespace ScalableMssqlApi.Controllers
                 while (await reader.ReadAsync())
                 {
                     var row = new Dictionary<string, object>();
-                    for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                    for (int i = 0; i < reader.FieldCount; i++) {
+                        if (reader.IsDBNull(i))
+                            row[reader.GetName(i)] = null;
+                        else
+                            row[reader.GetName(i)] = reader.GetValue(i);
+                    }
                     summaries.Add(row);
                 }
             }
@@ -130,12 +135,12 @@ namespace ScalableMssqlApi.Controllers
             
             var detailSql = $@"
                 SELECT OffenderNumber, Location, Offense, CommitmentDate, TDD_SDD
-                FROM dbo.Offender_Detail
+                FROM dbo.Offender_Detail WITH (NOLOCK)
                 WHERE OffenderNumber IN ('{idList}')";
             
             var chargeSql = $@"
                 SELECT OffenderNumber, SupervisionStatus, OffenseClass, CountyOfCommitment, EndDate
-                FROM dbo.Offender_Charges
+                FROM dbo.Offender_Charges WITH (NOLOCK)
                 WHERE OffenderNumber IN ('{idList}')";
 
             var details = new Dictionary<string, Dictionary<string, object>>();
@@ -150,7 +155,12 @@ namespace ScalableMssqlApi.Controllers
                 {
                     var oid = reader["OffenderNumber"].ToString();
                     var row = new Dictionary<string, object>();
-                    for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                    for (int i = 0; i < reader.FieldCount; i++) {
+                        if (reader.IsDBNull(i))
+                            row[reader.GetName(i)] = null;
+                        else
+                            row[reader.GetName(i)] = reader.GetValue(i);
+                    }
                     if (!details.ContainsKey(oid)) details[oid] = row;
                 }
             }
@@ -164,7 +174,12 @@ namespace ScalableMssqlApi.Controllers
                {
                    var oid = reader["OffenderNumber"].ToString();
                    var row = new Dictionary<string, object>();
-                   for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                   for (int i = 0; i < reader.FieldCount; i++) {
+                       if (reader.IsDBNull(i))
+                           row[reader.GetName(i)] = null;
+                       else
+                           row[reader.GetName(i)] = reader.GetValue(i);
+                   }
                    if (!charges.ContainsKey(oid)) charges[oid] = new List<Dictionary<string, object>>();
                    charges[oid].Add(row);
                }
@@ -221,7 +236,7 @@ namespace ScalableMssqlApi.Controllers
         [HttpGet("traffic")]
         public async Task<IActionResult> GetTraffic([FromQuery] int limit = 100, [FromQuery] DateTime? dateFrom = null, [FromQuery] DateTime? dateTo = null)
         {
-             var sql = "SELECT TOP (@Limit) [key], event_time, charge, name, location, id as event_number FROM dbo.DailyBulletinArrests WHERE ([key] != 'AR' AND [key] != 'LW')";
+             var sql = "SELECT TOP (@Limit) [key], event_time, charge, name, location, row_hash as event_number FROM dbo.DailyBulletinArrests WHERE ([key] != 'AR' AND [key] != 'LW')";
              var parameters = new Dictionary<string, object> { { "@Limit", limit } };
 
              if (dateFrom.HasValue) 
@@ -300,13 +315,19 @@ namespace ScalableMssqlApi.Controllers
              await conn.OpenAsync();
              using var cmd = conn.CreateCommand();
              cmd.CommandText = sql;
+             cmd.CommandTimeout = 120; // Increase timeout for slow queries
              if (parameters != null) {
                  foreach (var kvp in parameters) cmd.Parameters.AddWithValue(kvp.Key, kvp.Value ?? DBNull.Value);
              }
              using var reader = await cmd.ExecuteReaderAsync();
              while (await reader.ReadAsync()) {
                  var row = new Dictionary<string, object>();
-                 for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                 for (int i = 0; i < reader.FieldCount; i++) {
+                     if (reader.IsDBNull(i)) 
+                         row[reader.GetName(i)] = null;
+                     else 
+                         row[reader.GetName(i)] = reader.GetValue(i);
+                 }
                  results.Add(row); 
              }
              return Ok(new { data = results });
@@ -387,13 +408,13 @@ namespace ScalableMssqlApi.Controllers
 
             // Unified Person Search Query - Parameterized
             var sql = @"
-                SELECT 'ARREST' as type, event_time as date, name, charge as details, location, id as ref_id, NULL as lat, NULL as lon FROM dbo.DailyBulletinArrests WHERE name LIKE @Term
+                SELECT 'ARREST' as type, event_time as date, name, charge as details, location, row_hash as ref_id, NULL as lat, NULL as lon FROM dbo.DailyBulletinArrests WHERE name LIKE @Term
                 UNION ALL
-                SELECT 'CITATION' as type, event_time as date, name, charge as details, location, id as ref_id, NULL, NULL FROM dbo.DailyBulletinArrests WHERE [key] = 'TC' AND name LIKE @Term
+                SELECT 'CITATION' as type, event_time as date, name, charge as details, location, row_hash as ref_id, NULL, NULL FROM dbo.DailyBulletinArrests WHERE [key] = 'TC' AND name LIKE @Term
                 UNION ALL
-                SELECT 'ACCIDENT' as type, event_time as date, name, charge as details, location, id as ref_id, NULL, NULL FROM dbo.DailyBulletinArrests WHERE [key] = 'TA' AND name LIKE @Term
+                SELECT 'ACCIDENT' as type, event_time as date, name, charge as details, location, row_hash as ref_id, NULL, NULL FROM dbo.DailyBulletinArrests WHERE [key] = 'TA' AND name LIKE @Term
                 UNION ALL
-                SELECT 'CRIME' as type, event_time as date, name, charge as details, location, id as ref_id, NULL, NULL FROM dbo.DailyBulletinArrests WHERE [key] = 'LW' AND name LIKE @Term
+                SELECT 'CRIME' as type, event_time as date, name, charge as details, location, row_hash as ref_id, NULL, NULL FROM dbo.DailyBulletinArrests WHERE [key] = 'LW' AND name LIKE @Term
                 UNION ALL
                 SELECT 'SEX_OFFENDER' as type, last_changed as date, (first_name + ' ' + last_name) as name, ('Tier ' + CAST(tier as varchar)) as details, address_line_1 as location, registrant_id as ref_id, lat, lon FROM dbo.sexoffender_registrants WHERE (first_name + ' ' + last_name) LIKE @Term
                 ORDER BY date DESC
@@ -419,81 +440,197 @@ namespace ScalableMssqlApi.Controllers
         }
 
         [HttpGet("incidents")]
-        public async Task<IActionResult> GetIncidents([FromQuery] int cadLimit = 1000, [FromQuery] int arrestLimit = 1000, [FromQuery] int crimeLimit = 1000, [FromQuery] DateTime? dateFrom = null, [FromQuery] DateTime? dateTo = null)
+        public async Task<IActionResult> GetIncidents(
+            [FromQuery] string? search = null,
+            [FromQuery] string? types = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int limit = 50,
+            [FromQuery] DateTime? dateFrom = null,
+            [FromQuery] DateTime? dateTo = null)
         {
-             // Optimized combined fetcher to reduce round trips
-             // For now, implementing basic dispatch/arrest fetch to support App.jsx
-             // This replaces the complex filters: '' logic in client.js with a dedicated handler if needed.
-             // But client.js calls GET /incidents.
-             
-             // Wait, the client.js calls /api/incidents. This endpoint WAS missing too?
-             // Let's implement it to return the 'data' structure expected by client.js: { data: [...] }
-             
-             // Actually, to save time, I will route /incidents to a simple 24h query or similar if parameters provided?
-             // The client passes separate limits.
-             
+             var offset = (page - 1) * limit;
              var results = new List<Dictionary<string, object>>();
              using var conn = new SqlConnection(_connectionString);
              await conn.OpenAsync();
              using var cmd = conn.CreateCommand();
 
-             // 1. Arrests
-             var sqlArrest = $"SELECT TOP (@ArrestLimit) id, event_time, charge, name, firstname, lastname, location, [key], geox, geoy, 'DailyBulletinArrests' as _source FROM dbo.DailyBulletinArrests WHERE [key] = 'AR'";
-             if (dateFrom.HasValue) sqlArrest += " AND event_time >= @DateFrom";
-             
-             // 2. CAD - Use cadHandler which has geocoded data
-             var sqlCad = $"SELECT TOP (@CadLimit) id, starttime, nature, address, agency, geox, geoy, 'cadHandler' as _source FROM dbo.cadHandler WHERE 1=1";
-             if (dateFrom.HasValue) sqlCad += " AND starttime >= @DateFrom";
+             var whereArr = "1=1";
+             var whereCad = "1=1";
+             var whereSex = "1=1";
+             var parameters = new Dictionary<string, object> { 
+                 { "@Limit", limit }, 
+                 { "@Offset", offset } 
+             };
 
-             cmd.CommandText = sqlArrest + "; " + sqlCad;
-             cmd.Parameters.AddWithValue("@ArrestLimit", arrestLimit);
-             cmd.Parameters.AddWithValue("@CadLimit", cadLimit);
-             if (dateFrom.HasValue) cmd.Parameters.AddWithValue("@DateFrom", dateFrom.Value);
-
-             using var reader = await cmd.ExecuteReaderAsync();
-             // Read Arrests
-             while (await reader.ReadAsync()) {
-                 var row = new Dictionary<string, object>();
-                 for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
-                 results.Add(row); 
-             }
+             // Type Filtering
+             // Types: arrest, crime, traffic, accident, cad, sex_offender
+             // If types are provided, we narrow down the 1=1 default.
+             // If a subquery is NOT needed, we can set its where to 1=0 to skip it efficiently? 
+             // Or better, we build the UNION dynamically or just filter inside each. 
+             // Filtering inside is safer and easier.
              
-             // Read CAD
-             if (await reader.NextResultAsync()) {
-                 while (await reader.ReadAsync()) {
-                     var row = new Dictionary<string, object>();
-                     for (int i = 0; i < reader.FieldCount; i++) {
-                         var name = reader.GetName(i);
-                         // Map cadHandler columns to what frontend might expect if needed
-                         // cadHandler has 'starttime', DispatchCalls had 'TimeReceived'
-                         // Frontend seems to handle 'time' || 'event_time', so let's see. 
-                         // To be safe, let's just pass raw for now, client.js or component handles display.
-                         row[name] = reader.GetValue(i);
-                     }
-                     results.Add(row);
+             bool includeArrest = true; // AR
+             bool includeCrime = true;  // LW
+             bool includeTraffic = true; // TC
+             bool includeAccident = true; // TA
+             bool includeCad = true;
+             bool includeSex = true;
+
+             if (!string.IsNullOrWhiteSpace(types)) {
+                 var t = types.ToLower().Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).ToHashSet();
+                 if (t.Any()) {
+                     includeArrest = t.Contains("arrest");
+                     includeCrime = t.Contains("crime");
+                     includeTraffic = t.Contains("traffic");
+                     includeAccident = t.Contains("accident");
+                     includeCad = t.Contains("cad") || t.Contains("details"); // 'details' legacy?
+                     includeSex = t.Contains("sex_offender");
                  }
              }
 
-             return Ok(new { data = results });
+             // Apply filters to DailyBulletinArrests based on keys
+             // [key] IN (...)
+             var arrestKeys = new List<string>();
+             if (includeArrest) arrestKeys.Add("'AR'");
+             if (includeCrime) arrestKeys.Add("'LW'");
+             if (includeTraffic) arrestKeys.Add("'TC'");
+             if (includeAccident) arrestKeys.Add("'TA'");
+             
+             if (arrestKeys.Any()) {
+                 whereArr += $" AND [key] IN ({string.Join(",", arrestKeys)})";
+             } else {
+                 whereArr = "1=0"; // Skip this table
+             }
+             
+             if (!includeCad) whereCad = "1=0";
+             if (!includeSex) whereSex = "1=0";
+
+             if (dateFrom.HasValue) {
+                 whereArr += " AND event_time >= @DateFrom";
+                 whereCad += " AND starttime >= @DateFrom";
+                 // Sex offenders dont have event time, maybe date_scraped or last_changed? 
+                 // Let's use date_scraped or valid_date. If null, include? 
+                 // Usually sex offenders are evergreen list, so maybe ignore date filter? 
+                 // User wants a feed. If date filter is applied, maybe just omit?
+                 // Or map 'last_update_date' if available. 
+                 // Sex offenders
+                 // Use last_changed as event time proxy
+                 whereSex += " AND last_changed >= @DateFrom";
+                 parameters.Add("@DateFrom", dateFrom.Value);
+             }
+             if (dateTo.HasValue) {
+                 whereArr += " AND event_time <= @DateTo";
+                 whereCad += " AND starttime <= @DateTo";
+                 whereSex += " AND last_changed <= @DateTo";
+                 parameters.Add("@DateTo", dateTo.Value);
+             }
+
+             if (!string.IsNullOrWhiteSpace(search)) {
+                 var term = "%" + search + "%";
+                 // Search Description, Location, Name
+                 whereArr += " AND (charge LIKE @Search OR location LIKE @Search OR name LIKE @Search)";
+                 whereCad += " AND (nature LIKE @Search OR address LIKE @Search OR agency LIKE @Search)";
+                 whereSex += " AND (first_name LIKE @Search OR last_name LIKE @Search OR address_line_1 LIKE @Search)";
+                 parameters.Add("@Search", term);
+             }
+
+             // Unified Query
+             // Aliases: ID, EventTime, Description, Location, PrimaryPerson, SourceType, Lat, Lon
+
+             var sql = $@"
+                 SELECT ID, EventTime, Description, Location, PrimaryPerson, SourceType, Lat, Lon 
+                 FROM (
+                     SELECT 
+                        CAST(id as varchar(50)) as ID, 
+                        event_time as EventTime, 
+                        charge as Description, 
+                        location as Location, 
+                        name as PrimaryPerson, 
+                        [key] as SourceType, 
+                        TRY_CAST(geox as float) as Lat, 
+                        TRY_CAST(geoy as float) as Lon
+                     FROM dbo.DailyBulletinArrests WITH (NOLOCK)
+                     WHERE {whereArr}
+                     
+                     UNION ALL
+
+                     SELECT 
+                        CAST(id as varchar(50)) as ID, 
+                        starttime as EventTime, 
+                        nature as Description, 
+                        address as Location, 
+                        agency as PrimaryPerson, 
+                        'CAD' as SourceType, 
+                        TRY_CAST(geox as float) as Lat, 
+                        TRY_CAST(geoy as float) as Lon
+                     FROM dbo.cadHandler WITH (NOLOCK)
+                     WHERE {whereCad}
+
+                     UNION ALL
+                     
+                     SELECT 
+                         CAST(registrant_id as varchar(50)) as ID,
+                         last_changed as EventTime,
+                         'Registered Sex Offender' as Description,
+                         ISNULL(address_line_1, '') + ' ' + ISNULL(city, '') as Location,
+                         first_name + ' ' + last_name as PrimaryPerson,
+                         'SEX_OFFENDER' as SourceType,
+                         TRY_CAST(lat as float) as Lat,
+                         TRY_CAST(lon as float) as Lon
+                     FROM dbo.sexoffender_registrants WITH (NOLOCK)
+                     WHERE {whereSex}
+
+                 ) AS Combined
+                 ORDER BY EventTime DESC
+                 OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
+
+             cmd.CommandText = sql;
+             foreach(var p in parameters) cmd.Parameters.AddWithValue(p.Key, p.Value ?? DBNull.Value);
+
+             using var reader = await cmd.ExecuteReaderAsync();
+             while (await reader.ReadAsync()) {
+                 var row = new Dictionary<string, object>();
+                 for (int i = 0; i < reader.FieldCount; i++) {
+                     if (reader.IsDBNull(i)) 
+                         row[reader.GetName(i)] = null;
+                     else 
+                         row[reader.GetName(i)] = reader.GetValue(i);
+                 }
+                 results.Add(row); 
+             }
+             
+             // Meta for pagination
+             return Ok(new { data = results, meta = new { page, limit } });
         }
 
         [HttpGet("stats/jail")]
         public async Task<IActionResult> GetJailStats()
         {
              // 1. Base Stats
+             // 1. Base Stats - Consolidated into one query with NOLOCK
              var baseSql = @"
                 SELECT
-                  (SELECT COUNT(*) FROM jail_inmates WHERE released_date IS NULL) as TotalInmates,
-                  (SELECT AVG(TRY_CAST(replace(total_bond_amount, '$', '') AS float)) FROM jail_inmates WHERE released_date IS NULL) as AvgBond,
-                  (SELECT SUM(TRY_CAST(replace(total_bond_amount, '$', '') AS float)) FROM jail_inmates WHERE released_date IS NULL) as TotalBond,
-                  (SELECT sex as name, COUNT(*) as value FROM jail_inmates WHERE released_date IS NULL AND sex IS NOT NULL GROUP BY sex FOR JSON PATH) as SexDist,
-                  (SELECT race as name, COUNT(*) as value FROM jail_inmates WHERE released_date IS NULL AND race IS NOT NULL GROUP BY race FOR JSON PATH) as RaceDist";
+                  COUNT(*) as TotalInmates,
+                  AVG(TRY_CAST(replace(total_bond_amount, '$', '') AS float)) as AvgBond,
+                  SUM(TRY_CAST(replace(total_bond_amount, '$', '') AS float)) as TotalBond
+                FROM jail_inmates WITH (NOLOCK)
+                WHERE released_date IS NULL;
+
+                SELECT sex as name, COUNT(*) as value 
+                FROM jail_inmates WITH (NOLOCK)
+                WHERE released_date IS NULL AND sex IS NOT NULL 
+                GROUP BY sex FOR JSON PATH;
+
+                SELECT race as name, COUNT(*) as value 
+                FROM jail_inmates WITH (NOLOCK)
+                WHERE released_date IS NULL AND race IS NOT NULL 
+                GROUP BY race FOR JSON PATH;";
              
-             // 2. Charge Counts - Optimized into SQL instead of JS
+             // 2. Charge Counts - Added NOLOCK
              var chargeSql = @"
                 SELECT TOP 10 charge_description as name, COUNT(*) as value
-                FROM jail_charges c
-                JOIN jail_inmates i ON c.book_id = i.book_id
+                FROM jail_charges c WITH (NOLOCK)
+                JOIN jail_inmates i WITH (NOLOCK) ON c.book_id = i.book_id
                 WHERE i.released_date IS NULL AND charge_description IS NOT NULL
                 GROUP BY charge_description
                 ORDER BY COUNT(*) DESC
@@ -504,14 +641,30 @@ namespace ScalableMssqlApi.Controllers
              await conn.OpenAsync();
              using var cmd = conn.CreateCommand();
              cmd.CommandText = baseSql + "; " + chargeSql;
+             cmd.CommandTimeout = 120; // Increase timeout
 
              using var reader = await cmd.ExecuteReaderAsync();
-             if (await reader.ReadAsync()) {
-                 for(int i=0; i<reader.FieldCount; i++) results[reader.GetName(i)] = reader.GetValue(i);
-             }
              
+             // 1. Aggregates
+             if (await reader.ReadAsync()) {
+                 results["TotalInmates"] = reader["TotalInmates"];
+                 results["AvgBond"] = reader["AvgBond"];
+                 results["TotalBond"] = reader["TotalBond"];
+             }
+
+             // 2. SexDist
              if (await reader.NextResultAsync()) {
-                 if (await reader.ReadAsync()) results["TopCharges"] = reader.GetValue(0); // FOR JSON PATH returns 1 column
+                 if (await reader.ReadAsync()) results["SexDist"] = reader.GetValue(0);
+             }
+
+             // 3. RaceDist
+             if (await reader.NextResultAsync()) {
+                 if (await reader.ReadAsync()) results["RaceDist"] = reader.GetValue(0);
+             }
+
+             // 4. TopCharges
+             if (await reader.NextResultAsync()) {
+                 if (await reader.ReadAsync()) results["TopCharges"] = reader.GetValue(0);
              }
 
              return Ok(new { data = new[] { results } });
@@ -535,7 +688,7 @@ namespace ScalableMssqlApi.Controllers
                 SELECT 
                   book_id, invid, firstname, lastname, dob, arrest_date, released_date,
                   age, race, sex, total_bond_amount, next_court_date
-                FROM jail_inmates 
+                FROM jail_inmates WITH (NOLOCK)
                 WHERE {where}
                 ORDER BY arrest_date DESC
                 OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
@@ -547,13 +700,19 @@ namespace ScalableMssqlApi.Controllers
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = sql;
+                cmd.CommandTimeout = 120; // 2 min timeout
                 foreach(var p in parameters) cmd.Parameters.AddWithValue(p.Key, p.Value);
 
                 using var reader = await cmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
                 {
                     var row = new Dictionary<string, object>();
-                    for (int i = 0; i < reader.FieldCount; i++) row[reader.GetName(i)] = reader.GetValue(i);
+                    for (int i = 0; i < reader.FieldCount; i++) {
+                        if (reader.IsDBNull(i))
+                            row[reader.GetName(i)] = null;
+                        else
+                            row[reader.GetName(i)] = reader.GetValue(i);
+                    }
                     inmates.Add(row);
                 }
             }
@@ -566,7 +725,7 @@ namespace ScalableMssqlApi.Controllers
 
             var chargesSql = $@"
                 SELECT book_id, charge_description 
-                FROM jail_charges 
+                FROM jail_charges WITH (NOLOCK)
                 WHERE book_id IN ('{idList}')
                 ORDER BY charge_description"; // Order for consistency
 
@@ -574,6 +733,7 @@ namespace ScalableMssqlApi.Controllers
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = chargesSql;
+                cmd.CommandTimeout = 120;
                 using var reader = await cmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
                 {
@@ -665,13 +825,13 @@ namespace ScalableMssqlApi.Controllers
                           FROM jail_inmates i WHERE {where} ORDER BY i.arrest_date DESC";
              } 
              else if (type == "arrest") {
-                 sql = $"SELECT TOP 20 id, event_time, charge, name, firstname, lastname, location, [key] FROM dbo.DailyBulletinArrests WHERE {where} AND [key] = 'AR' ORDER BY event_time DESC";
+                 sql = $"SELECT TOP 20 row_hash as id, event_time, charge, name, firstname, lastname, location, [key] FROM dbo.DailyBulletinArrests WHERE {where} AND [key] = 'AR' ORDER BY event_time DESC";
              }
              else if (type == "traffic") {
-                 sql = $"SELECT TOP 20 id, event_time, charge, name, firstname, lastname, location, [key] FROM dbo.DailyBulletinArrests WHERE {where} AND ([key] = 'TC' OR [key] = 'TA') ORDER BY event_time DESC";
+                 sql = $"SELECT TOP 20 row_hash as id, event_time, charge, name, firstname, lastname, location, [key] FROM dbo.DailyBulletinArrests WHERE {where} AND ([key] = 'TC' OR [key] = 'TA') ORDER BY event_time DESC";
              }
              else if (type == "crime") {
-                 sql = $"SELECT TOP 20 id, event_time, charge, name, firstname, lastname, location, [key] FROM dbo.DailyBulletinArrests WHERE {where} AND [key] = 'LW' ORDER BY event_time DESC";
+                 sql = $"SELECT TOP 20 row_hash as id, event_time, charge, name, firstname, lastname, location, [key] FROM dbo.DailyBulletinArrests WHERE {where} AND [key] = 'LW' ORDER BY event_time DESC";
              }
              else return BadRequest("Invalid type");
 
@@ -690,32 +850,41 @@ namespace ScalableMssqlApi.Controllers
              // 1. Summary
              cmd.CommandText = "SELECT TOP 1 OffenderNumber, Name, Gender, Age, DateScraped FROM dbo.Offender_Summary WHERE OffenderNumber = @Num";
              using (var r = await cmd.ExecuteReaderAsync()) {
-                 if (await r.ReadAsync()) {
-                     var row = new Dictionary<string, object>();
-                     for(int i=0; i<r.FieldCount; i++) row[r.GetName(i)] = r.GetValue(i);
-                     finalRes["summary"] = row;
-                 }
+                  if (await r.ReadAsync()) {
+                      var row = new Dictionary<string, object>();
+                      for(int i=0; i<r.FieldCount; i++) {
+                           if (r.IsDBNull(i)) row[r.GetName(i)] = null;
+                           else row[r.GetName(i)] = r.GetValue(i);
+                      }
+                      finalRes["summary"] = row;
+                  }
              }
              
              // 2. Detail
              cmd.CommandText = "SELECT TOP 1 OffenderNumber, Location, Offense, TDD_SDD, CommitmentDate, RecallDate, InterviewDate, MandatoryMinimum, DecisionType, Decision, DecisionDate, EffectiveDate FROM dbo.Offender_Detail WHERE OffenderNumber = @Num";
              using (var r = await cmd.ExecuteReaderAsync()) {
-                 if (await r.ReadAsync()) {
-                     var row = new Dictionary<string, object>();
-                     for(int i=0; i<r.FieldCount; i++) row[r.GetName(i)] = r.GetValue(i);
-                     finalRes["detail"] = row;
-                 }
+                  if (await r.ReadAsync()) {
+                      var row = new Dictionary<string, object>();
+                      for(int i=0; i<r.FieldCount; i++) {
+                           if (r.IsDBNull(i)) row[r.GetName(i)] = null;
+                           else row[r.GetName(i)] = r.GetValue(i);
+                      }
+                      finalRes["detail"] = row;
+                  }
              }
 
              // 3. Charges
              cmd.CommandText = "SELECT ChargeID, OffenderNumber, SupervisionStatus, OffenseClass, CountyOfCommitment, EndDate FROM dbo.Offender_Charges WHERE OffenderNumber = @Num ORDER BY EndDate DESC";
              var chargesList = new List<Dictionary<string, object>>();
              using (var r = await cmd.ExecuteReaderAsync()) {
-                 while (await r.ReadAsync()) {
-                     var row = new Dictionary<string, object>();
-                     for(int i=0; i<r.FieldCount; i++) row[r.GetName(i)] = r.GetValue(i);
-                     chargesList.Add(row);
-                 }
+                  while (await r.ReadAsync()) {
+                      var row = new Dictionary<string, object>();
+                      for(int i=0; i<r.FieldCount; i++) {
+                           if (r.IsDBNull(i)) row[r.GetName(i)] = null;
+                           else row[r.GetName(i)] = r.GetValue(i);
+                      }
+                      chargesList.Add(row);
+                  }
              }
              finalRes["charges"] = chargesList;
 
@@ -727,8 +896,8 @@ namespace ScalableMssqlApi.Controllers
         {
             var offset = (page - 1) * limit;
             var sql = @"
-                SELECT ArrestRecordName, ArrestCharge, OriginalOffenses, DocOffenderNumber as OffenderNumbers, 
-                       ArrestDate as event_time, ArrestLocation as location, JailBookId, JailBondAmount, JailCharges, JailArrestDate, JailReleasedDate
+                SELECT ArrestRecordName as name, ArrestCharge as details, OriginalOffenses, DocOffenderNumber as OffenderNumbers, 
+                       ArrestDate as event_time, ArrestDate as date, ArrestLocation as location, JailBookId, JailBondAmount, JailCharges, JailArrestDate, JailReleasedDate
                 FROM vw_ViolatorsWithJailInfo A
                 WHERE 1=1";
             

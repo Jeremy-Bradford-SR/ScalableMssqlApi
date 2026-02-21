@@ -117,6 +117,22 @@ Fetches the registry of Sex Offenders.
 
 ## GET /api/data/search360
 Performs a global text search across Arrests, Citations, Accidents, Crimes, and Sex Offenders.
-- **Parameters**: `q` (search term), `page`, `limit`.
 - **Response**: `{ data: [ { type: 'ARREST'|'CITATION'|..., name, details, ... } ] }`
 
+---
+
+## Architecture & Schema Implementation Notes
+
+### `row_hash` Identity System
+Historically, the database tables relied on auto-incrementing integer `id` columns or poorly scraped strings. 
+This has been completely overhauled to use a deterministic MD5 hash composite key sequence.
+- Primary Keys for ingested rows are now uniquely generated via `hash(raw_id + name + time + charge + location)`.
+- This prevents Database duplication while simultaneously ensuring that the exact same person arrested on multiple distinct charges in the same incident isn't accidentally collapsed into a single database row.
+
+### `tools/*` ETL Fallback Endpoints
+The `ScalableMssqlApi` exposes specialized endpoints exclusively for the Python ETL post-processing orchestrators:
+- `GET /api/tools/dab-time/candidates`: Used by Python to pull batches of un-parsed Daily Bulletin timestamp strings.
+- `POST /api/tools/dab-time/update`: Used by Python to write a standardized `event_time` back to the row.
+- `GET /api/tools/geocode/candidates`: Used to fetch batch subsets of un-geocoded addresses.
+- `POST /api/tools/geocode/update`: Writes derived `latitude` and `longitude` back to the DB payload.
+- `POST /api/tools/daily-bulletin/ids`: Used during Database Verification validation sweeps to ensure inserted `row_hash` IDs exist.

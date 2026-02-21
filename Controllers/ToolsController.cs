@@ -25,6 +25,86 @@ namespace ScalableMssqlApi.Controllers
             public string Table { get; set; }
         }
 
+        [HttpGet("diagnostics/counts")]
+        public async Task<IActionResult> GetDiagnosticCounts()
+        {
+            using var conn = new SqlConnection(_connectionString);
+            var results = new Dictionary<string, object>();
+            
+            results["total"] = await conn.QuerySingleAsync<int>("SELECT COUNT(*) FROM DailyBulletinArrests");
+            results["nbsp_count"] = await conn.QuerySingleAsync<int>("SELECT COUNT(*) FROM DailyBulletinArrests WHERE site_id = '&nbsp;'");
+            results["by_key"] = await conn.QueryAsync("SELECT [key], COUNT(*) as count FROM DailyBulletinArrests GROUP BY [key]");
+            
+            // Get PKs
+            var pkSql = @"SELECT COLUMN_NAME
+                        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                        WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + QUOTENAME(CONSTRAINT_NAME)), 'IsPrimaryKey') = 1
+                        AND TABLE_NAME = 'DailyBulletinArrests'";
+            results["pks"] = await conn.QueryAsync<string>(pkSql);
+            
+            return Ok(results);
+        }
+
+        [HttpPost("schema/rebuild-daily-bulletin")]
+        public async Task<IActionResult> RebuildDailyBulletinSchema()
+        {
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync();
+            using var tran = conn.BeginTransaction();
+            try {
+                var sql = @"
+                    DROP TABLE IF EXISTS [dbo].[DailyBulletinArrests];
+                    
+                    CREATE TABLE [dbo].[DailyBulletinArrests](
+                        [row_hash] [nvarchar](50) NOT NULL,
+                        [site_id] [nvarchar](50) NULL,
+                        [invid] [nvarchar](50) NULL,
+                        [key] [nvarchar](50) NOT NULL,
+                        [location] [nvarchar](500) NULL,
+                        [name] [nvarchar](255) NULL,
+                        [crime] [nvarchar](500) NULL,
+                        [time] [nvarchar](100) NULL,
+                        [property] [nvarchar](255) NULL,
+                        [officer] [nvarchar](255) NULL,
+                        [case] [nvarchar](1500) NULL,
+                        [description] [nvarchar](1000) NULL,
+                        [race] [nvarchar](100) NULL,
+                        [sex] [nvarchar](50) NULL,
+                        [lastname] [nvarchar](100) NULL,
+                        [firstname] [nvarchar](100) NULL,
+                        [charge] [nvarchar](500) NULL,
+                        [middlename] [nvarchar](100) NULL,
+                        [lat] [float] NULL,
+                        [lon] [float] NULL,
+                        [event_time] [datetime] NULL,
+                        CONSTRAINT [PK_DailyBulletinArrests] PRIMARY KEY CLUSTERED ([row_hash] ASC)
+                    );
+
+                    CREATE NONCLUSTERED INDEX [IX_DailyBulletinArrests_KeyTime] ON [dbo].[DailyBulletinArrests] ([key] ASC, [event_time] DESC);
+                    CREATE NONCLUSTERED INDEX [IX_DailyBulletinArrests_Name] ON [dbo].[DailyBulletinArrests] ([lastname] ASC, [firstname] ASC);
+                    CREATE NONCLUSTERED INDEX [IX_DailyBulletinArrests_SiteId] ON [dbo].[DailyBulletinArrests] ([site_id] ASC);
+                    CREATE NONCLUSTERED INDEX [IX_DailyBulletinArrests_Crime] ON [dbo].[DailyBulletinArrests] ([crime] ASC);
+                    CREATE NONCLUSTERED INDEX [IX_DailyBulletinArrests_Location] ON [dbo].[DailyBulletinArrests] ([location] ASC);
+                    CREATE NONCLUSTERED INDEX [IX_DailyBulletinArrests_SpatialMock] ON [dbo].[DailyBulletinArrests] ([lat] ASC, [lon] ASC);
+                ";
+                await conn.ExecuteAsync(sql, transaction: tran);
+                tran.Commit();
+                return Ok(new { status = "success", message = "DailyBulletinArrests table dropped and recreated successfully with advanced indexes."});
+            } catch (Exception ex) {
+                tran.Rollback();
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
+        [HttpGet("schema/describe/{table}")]
+        public async Task<IActionResult> DescribeTable(string table)
+        {
+            using var conn = new SqlConnection(_connectionString);
+            var sql = "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @table";
+            var res = await conn.QueryAsync(sql, new { table });
+            return Ok(res);
+        }
+
         [HttpPost("schema/ensure-geocode-columns")]
         public async Task<IActionResult> EnsureGeocodeColumns([FromBody] EnsureColumnsRequest req)
         {
@@ -65,7 +145,7 @@ namespace ScalableMssqlApi.Controllers
                  // Script logic: "lat IS NULL". If failed it sets to 0. So we only fetch NULL.
                  sql = $"SELECT TOP {count} id as Id, address as Address FROM cadHandler WHERE lat IS NULL AND address IS NOT NULL ORDER BY starttime DESC";
             } else if (string.Equals(table, "DailyBulletinArrests", StringComparison.OrdinalIgnoreCase)) {
-                 sql = $"SELECT TOP {count} id as Id, location as Address FROM DailyBulletinArrests WHERE lat IS NULL AND location IS NOT NULL ORDER BY [time] DESC";
+                 sql = $"SELECT TOP {count} row_hash as Id, location as Address FROM DailyBulletinArrests WHERE lat IS NULL AND location IS NOT NULL ORDER BY [time] DESC";
             } else if (string.Equals(table, "sexoffender_registrants", StringComparison.OrdinalIgnoreCase)) {
                  sql = $"SELECT TOP {count} registrant_id as Id, ISNULL(address_line_1,'') + ' ' + ISNULL(city,'') + ' ' + ISNULL(state,'') as Address FROM sexoffender_registrants WHERE lat IS NULL";
             } else {
@@ -93,7 +173,7 @@ namespace ScalableMssqlApi.Controllers
              if (req.Table.Equals("cadHandler", StringComparison.OrdinalIgnoreCase)) 
                  sql = $"SELECT id as Id, address as Address FROM cadHandler WHERE id IN @Ids";
              else if (req.Table.Equals("DailyBulletinArrests", StringComparison.OrdinalIgnoreCase))
-                 sql = $"SELECT id as Id, location as Address FROM DailyBulletinArrests WHERE id IN @Ids";
+                 sql = $"SELECT row_hash as Id, location as Address FROM DailyBulletinArrests WHERE row_hash IN @Ids";
              else 
                  sql = $"SELECT registrant_id as Id, ISNULL(address_line_1,'') + ' ' + ISNULL(city,'') + ' ' + ISNULL(state,'') as Address FROM sexoffender_registrants WHERE registrant_id IN @Ids";
                  
@@ -127,7 +207,7 @@ namespace ScalableMssqlApi.Controllers
                     if (table.Equals("cadHandler", StringComparison.OrdinalIgnoreCase)) 
                         sql += "id=@Id"; 
                     else if (table.Equals("DailyBulletinArrests", StringComparison.OrdinalIgnoreCase))
-                        sql += "id=@Id";
+                        sql += "row_hash=@Id";
                     else if (table.Equals("sexoffender_registrants", StringComparison.OrdinalIgnoreCase))
                         sql += "registrant_id=@Id";
                         
@@ -151,8 +231,8 @@ namespace ScalableMssqlApi.Controllers
         public async Task<IActionResult> GetDabTimeCandidates([FromQuery] int count = 100)
         {
             using var conn = new SqlConnection(_connectionString);
-            // Script logic: (event_time IS NULL OR event_time = '1900-01-01')
-            var sql = $"SELECT TOP {count} id as Id, [time] as TimeText FROM DailyBulletinArrests WHERE (event_time IS NULL OR event_time = '1900-01-01')";
+            // Script logic: (event_time IS NULL)
+            var sql = $"SELECT TOP {count} row_hash as Id, [time] as TimeText FROM DailyBulletinArrests WHERE event_time IS NULL";
             var res = await conn.QueryAsync<DabTimeCandidateDto>(sql);
             return Ok(res);
         }
@@ -165,7 +245,7 @@ namespace ScalableMssqlApi.Controllers
         public async Task<IActionResult> FetchDabTimeDetails([FromBody] FetchDabTimeRequest req) {
              if (req.Ids == null || !req.Ids.Any()) return Ok(new List<DabTimeCandidateDto>());
              using var conn = new SqlConnection(_connectionString);
-             var res = await conn.QueryAsync<DabTimeCandidateDto>("SELECT id as Id, [time] as TimeText FROM DailyBulletinArrests WHERE id IN @Ids", new { req.Ids });
+             var res = await conn.QueryAsync<DabTimeCandidateDto>("SELECT row_hash as Id, [time] as TimeText FROM DailyBulletinArrests WHERE row_hash IN @Ids", new { req.Ids });
              return Ok(res);
         }
 
@@ -183,7 +263,7 @@ namespace ScalableMssqlApi.Controllers
             using var tran = conn.BeginTransaction();
             try {
                 foreach(var u in updates) {
-                    await conn.ExecuteAsync("UPDATE DailyBulletinArrests SET event_time=@EventTime WHERE id=@Id", u, transaction: tran);
+                    await conn.ExecuteAsync("UPDATE DailyBulletinArrests SET event_time=@EventTime WHERE row_hash=@Id", u, transaction: tran);
                 }
                 tran.Commit();
                 return Ok(new { count = updates.Count });
@@ -201,7 +281,7 @@ namespace ScalableMssqlApi.Controllers
         public async Task<IActionResult> GetDailyBulletinIds([FromBody] DateRangeRequest req)
         {
             using var conn = new SqlConnection(_connectionString);
-            var sql = "SELECT id FROM DailyBulletinArrests WHERE event_time >= @Start AND event_time <= @End";
+            var sql = "SELECT row_hash FROM DailyBulletinArrests WHERE event_time >= @Start AND event_time <= @End";
             var res = await conn.QueryAsync<string>(sql, new { req.Start, req.End });
             return Ok(res);
         }
