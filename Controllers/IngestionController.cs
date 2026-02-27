@@ -74,12 +74,15 @@ namespace ScalableMssqlApi.Controllers
 
             _logger.LogInformation($"Syncing {inmates.Count} inmates.");
             
-            using var conn = new SqlConnection(_connectionString);
-            await conn.OpenAsync();
-            using var tran = conn.BeginTransaction();
-
-            try
+            int maxRetries = 10;
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
+                using var conn = new SqlConnection(_connectionString);
+                await conn.OpenAsync();
+                using var tran = conn.BeginTransaction();
+
+                try
+                {
                 // 1. Check existence for ALL incoming IDs to decide Insert vs Update
                 // We cannot rely on 'released_date is null' because we might re-scrape a released inmate to update them (rare but possible)
                 // or the 'active' list method was missing released inmates causing PK violation on Insert.
@@ -122,6 +125,7 @@ namespace ScalableMssqlApi.Controllers
                     else
                     {
                         await conn.ExecuteAsync(insertSql, inmate, transaction: tran);
+                        existingIdsInDb.Add(inmate.book_id); // Prevent PK violation for duplicates in same batch
                         inserted++;
                     }
 
@@ -187,13 +191,30 @@ namespace ScalableMssqlApi.Controllers
                 tran.Commit();
                 return Ok(new { inserted, updated });
 
+                }
+                catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == 1205)
+                {
+                    tran.Rollback();
+                    if (attempt == maxRetries)
+                    {
+                        _logger.LogError(ex, "Jail Sync Failed permanently due to Deadlock.");
+                        return StatusCode(500, ex.Message);
+                    }
+                    else
+                    {
+                        var jitter = new Random().Next(200, 800);
+                        _logger.LogWarning($"Deadlock on Jail Sync, retrying {attempt}/{maxRetries} with {jitter}ms jitter...");
+                        await Task.Delay(jitter * attempt);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    tran.Rollback();
+                    _logger.LogError(ex, "Sync failed");
+                    return StatusCode(500, ex.Message);
+                }
             }
-            catch (Exception ex)
-            {
-                tran.Rollback();
-                _logger.LogError(ex, "Sync failed");
-                return StatusCode(500, ex.Message);
-            }
+            return StatusCode(500, "Exhausted retries");
         }
         // --- Recent Calls ---
         public class CadCallDto {
@@ -396,13 +417,13 @@ namespace ScalableMssqlApi.Controllers
         public class DocDetailDto {
             public string OffenderNumber { get; set; }
             public string? Location { get; set; }
-            public string Offense { get; set; }
+            public string? Offense { get; set; }
             public DateTime? TDD_SDD { get; set; }
             public DateTime? CommitmentDate { get; set; }
             public DateTime? RecallDate { get; set; }
-            public string InterviewDate { get; set; }
-            public string MandatoryMinimum { get; set; }
-            public string DecisionType { get; set; }
+            public string? InterviewDate { get; set; }
+            public string? MandatoryMinimum { get; set; }
+            public string? DecisionType { get; set; }
             public string? Decision { get; set; }
             public DateTime? DecisionDate { get; set; }
             public DateTime? EffectiveDate { get; set; }

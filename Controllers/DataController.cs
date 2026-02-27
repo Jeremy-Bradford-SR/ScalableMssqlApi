@@ -92,15 +92,39 @@ namespace ScalableMssqlApi.Controllers
         }
 
         [HttpGet("corrections")]
-        public async Task<IActionResult> GetCorrections([FromQuery] int page = 1, [FromQuery] int limit = 50)
+        public async Task<IActionResult> GetCorrections([FromQuery] int page = 1, [FromQuery] int limit = 50, [FromQuery] string? location = null, [FromQuery] string? search = null)
         {
             var offset = (page - 1) * limit;
             
             // 1. Fetch Summary IDs (Base Page)
             var baseSql = @"
-                SELECT OffenderNumber, Name, Gender, Age, DateScraped
-                FROM dbo.Offender_Summary WITH (NOLOCK)
-                ORDER BY DateScraped DESC
+                SELECT S.OffenderNumber, S.Name, S.Gender, S.Age, S.DateScraped
+                FROM dbo.Offender_Summary S WITH (NOLOCK)
+                ";
+            
+            bool needsDetailJoin = !string.IsNullOrEmpty(location) || !string.IsNullOrEmpty(search);
+
+            if (needsDetailJoin)
+            {
+                baseSql += " JOIN dbo.Offender_Detail D WITH (NOLOCK) ON S.OffenderNumber = D.OffenderNumber WHERE 1=1";
+            }
+            else 
+            {
+                baseSql += " WHERE 1=1";
+            }
+
+            if (!string.IsNullOrEmpty(location))
+            {
+                baseSql += " AND D.Location = @Location";
+            }
+
+            if (!string.IsNullOrEmpty(search))
+            {
+                baseSql += " AND (S.Name LIKE @SearchPattern OR D.Offense LIKE @SearchPattern OR D.Location LIKE @SearchPattern)";
+            }
+
+            baseSql += @"
+                ORDER BY S.DateScraped DESC
                 OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
 
             var summaries = new List<Dictionary<string, object>>();
@@ -113,6 +137,14 @@ namespace ScalableMssqlApi.Controllers
                 cmd.CommandText = baseSql;
                 cmd.Parameters.AddWithValue("@Offset", offset);
                 cmd.Parameters.AddWithValue("@Limit", limit);
+                if (!string.IsNullOrEmpty(location))
+                {
+                    cmd.Parameters.AddWithValue("@Location", location);
+                }
+                if (!string.IsNullOrEmpty(search))
+                {
+                    cmd.Parameters.AddWithValue("@SearchPattern", $"%{search}%");
+                }
                 using var reader = await cmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
                 {
@@ -131,10 +163,11 @@ namespace ScalableMssqlApi.Controllers
 
             // 2. Fetch Details for these IDs using simple string aggregation for IN clause (safe for ints/guids, sanitize strings)
             var ids = summaries.Select(s => s["OffenderNumber"].ToString()).Distinct().ToList();
+            if (ids.Count == 0) return Ok(new { data = summaries });
             var idList = string.Join("','", ids.Select(id => id.Replace("'", "''"))); 
             
             var detailSql = $@"
-                SELECT OffenderNumber, Location, Offense, CommitmentDate, TDD_SDD
+                SELECT OffenderNumber, Location, Offense, CONVERT(varchar, CommitmentDate, 101) as CommitmentDate, CONVERT(varchar, TDD_SDD, 101) as TDD_SDD
                 FROM dbo.Offender_Detail WITH (NOLOCK)
                 WHERE OffenderNumber IN ('{idList}')";
             
@@ -233,10 +266,63 @@ namespace ScalableMssqlApi.Controllers
             return await ExecuteSafeQuery(sql, parameters);
         }
 
-        [HttpGet("traffic")]
-        public async Task<IActionResult> GetTraffic([FromQuery] int limit = 100, [FromQuery] DateTime? dateFrom = null, [FromQuery] DateTime? dateTo = null)
+        [HttpGet("corrections/recent")]
+        public async Task<IActionResult> GetRecentDOC([FromQuery] string? search = null)
         {
-             var sql = "SELECT TOP (@Limit) [key], event_time, charge, name, location, row_hash as event_number FROM dbo.DailyBulletinArrests WHERE ([key] != 'AR' AND [key] != 'LW')";
+            var sql = @"
+                WITH RankedStatus AS (
+                    SELECT 
+                        [OffenderNumber],
+                        [SupervisionStatus],
+                        [CountyOfCommitment],
+                        [EndDate],
+                        LAG([SupervisionStatus]) OVER (PARTITION BY [OffenderNumber] ORDER BY ISNULL([EndDate], '9999-12-31') ASC) as PrevStatus,
+                        ROW_NUMBER() OVER (PARTITION BY [OffenderNumber] ORDER BY ISNULL([EndDate], '9999-12-31') DESC) as RecencyRank
+                    FROM [dbo].[Offender_Charges]
+                )
+                SELECT 
+                    S.[Name],
+                    R.[PrevStatus] + ' -> ' + R.[SupervisionStatus] as StatusUpdate,
+                    D.[Offense],
+                    S.[Gender],
+                    S.[Age],
+                    D.[Location],
+                    CONVERT(varchar, D.[CommitmentDate], 101) as CommitmentDate,
+                    CONVERT(varchar, D.[TDD_SDD], 101) as TDD_SDD,
+                    R.[CountyOfCommitment],
+                    R.[OffenderNumber]
+                FROM RankedStatus R
+                JOIN [dbo].[Offender_Detail] D ON R.[OffenderNumber] = D.[OffenderNumber]
+                JOIN [dbo].[Offender_Summary] S ON R.[OffenderNumber] = S.[OffenderNumber]
+                WHERE R.RecencyRank = 1 
+                  AND R.PrevStatus IS NOT NULL 
+                  AND R.PrevStatus <> R.[SupervisionStatus]
+                  AND R.[CountyOfCommitment] = 'Dubuque'";
+
+            var parameters = new Dictionary<string, object>();
+
+            if (!string.IsNullOrEmpty(search))
+            {
+                sql += " AND (S.Name LIKE @SearchPattern OR D.Offense LIKE @SearchPattern OR D.Location LIKE @SearchPattern)";
+                parameters.Add("@SearchPattern", $"%{search}%");
+            }
+
+            sql += " ORDER BY D.[CommitmentDate] DESC";
+            
+            return await ExecuteSafeQuery(sql, parameters);
+        }
+
+        [HttpGet("corrections/locations")]
+        public async Task<IActionResult> GetDOCLocations()
+        {
+            var sql = "SELECT DISTINCT Location FROM dbo.Offender_Detail WITH (NOLOCK) WHERE Location IS NOT NULL AND Location != '' ORDER BY Location";
+            return await ExecuteSafeQuery(sql, new Dictionary<string, object>());
+        }
+
+        [HttpGet("traffic")]
+        public async Task<IActionResult> GetTraffic([FromQuery] int limit = 100, [FromQuery] DateTime? dateFrom = null, [FromQuery] DateTime? dateTo = null, [FromQuery] string? search = null)
+        {
+             var sql = "SELECT TOP (@Limit) [key], event_time, charge, name, location, row_hash as event_number, TRY_CAST(lat as float) as lat, TRY_CAST(lon as float) as lon FROM dbo.DailyBulletinArrests WITH (NOLOCK) WHERE ([key] != 'AR' AND [key] != 'LW')";
              var parameters = new Dictionary<string, object> { { "@Limit", limit } };
 
              if (dateFrom.HasValue) 
@@ -248,6 +334,11 @@ namespace ScalableMssqlApi.Controllers
              {
                  sql += " AND event_time <= @DateTo";
                  parameters.Add("@DateTo", dateTo.Value);
+             }
+             if (!string.IsNullOrWhiteSpace(search))
+             {
+                 sql += " AND FREETEXT(*, @Search)";
+                 parameters.Add("@Search", search);
              }
              sql += " ORDER BY event_time DESC";
 
@@ -325,6 +416,8 @@ namespace ScalableMssqlApi.Controllers
                  for (int i = 0; i < reader.FieldCount; i++) {
                      if (reader.IsDBNull(i)) 
                          row[reader.GetName(i)] = null;
+                     else if (reader.GetName(i) == "photo_data" && reader.GetFieldType(i) == typeof(byte[]))
+                         row[reader.GetName(i)] = Convert.ToBase64String((byte[])reader.GetValue(i));
                      else 
                          row[reader.GetName(i)] = reader.GetValue(i);
                  }
@@ -334,33 +427,50 @@ namespace ScalableMssqlApi.Controllers
         }
 
         [HttpGet("sex-offenders")]
-        public async Task<IActionResult> GetSexOffenders([FromQuery] int page = 1, [FromQuery] int limit = 50)
+        public async Task<IActionResult> GetSexOffenders([FromQuery] int page = 1, [FromQuery] int limit = 50, [FromQuery] string? search = null)
         {
             var offset = (page - 1) * limit;
             var sql = @"
                 SELECT 
-                  registrant_id,
-                  first_name,
-                  middle_name,
-                  last_name,
-                  address_line_1,
-                  city,
-                  state,
-                  postal_code,
-                  county,
-                  lat,
-                  lon,
-                  photo_url,
-                  tier,
-                  gender,
-                  race,
-                  victim_minors,
-                  victim_adults,
-                  victim_unknown,
-                  registrant_cluster,
-                  last_changed
-                FROM dbo.sexoffender_registrants
-                ORDER BY last_changed DESC
+                  R.registrant_id,
+                  R.first_name,
+                  R.middle_name,
+                  R.last_name,
+                  R.address_line_1,
+                  R.city,
+                  R.state,
+                  R.postal_code,
+                  R.county,
+                  R.lat,
+                  R.lon,
+                  R.photo_url,
+                  R.tier,
+                  R.gender,
+                  R.race,
+                  R.victim_minors,
+                  R.victim_adults,
+                  R.victim_unknown,
+                  R.registrant_cluster,
+                  CONVERT(varchar, R.last_changed, 101) as last_changed,
+                  (
+                    SELECT STRING_AGG(V.gender + ' (' + V.age_group + ')', ', ')
+                    FROM sexoffender_convictions C
+                    JOIN sexoffender_conviction_victims V ON C.conviction_id = V.conviction_id
+                    WHERE C.registrant_id = R.registrant_id
+                  ) as victim_info
+                FROM dbo.sexoffender_registrants R
+                WHERE 1=1";
+
+            var parameters = new Dictionary<string, object> { { "@Offset", offset }, { "@Limit", limit } };
+
+            if (!string.IsNullOrWhiteSpace(search))
+            {
+                sql += " AND (R.first_name LIKE @Search OR R.last_name LIKE @Search OR R.address_line_1 LIKE @Search OR R.city LIKE @Search OR R.county LIKE @Search)";
+                parameters.Add("@Search", "%" + search + "%");
+            }
+
+            sql += @"
+                ORDER BY R.last_changed DESC
                 OFFSET @Offset ROWS FETCH NEXT @Limit ROWS ONLY";
 
             var results = new List<Dictionary<string, object>>();
@@ -368,8 +478,7 @@ namespace ScalableMssqlApi.Controllers
             await conn.OpenAsync();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = sql;
-            cmd.Parameters.AddWithValue("@Offset", offset);
-            cmd.Parameters.AddWithValue("@Limit", limit);
+            foreach (var p in parameters) cmd.Parameters.AddWithValue(p.Key, p.Value);
 
             using var reader = await cmd.ExecuteReaderAsync();
             while (await reader.ReadAsync())
@@ -446,7 +555,10 @@ namespace ScalableMssqlApi.Controllers
             [FromQuery] int page = 1,
             [FromQuery] int limit = 50,
             [FromQuery] DateTime? dateFrom = null,
-            [FromQuery] DateTime? dateTo = null)
+            [FromQuery] DateTime? dateTo = null,
+            [FromQuery] double? lat = null,
+            [FromQuery] double? lon = null,
+            [FromQuery] double radiusMiles = 1.0)
         {
              var offset = (page - 1) * limit;
              var results = new List<Dictionary<string, object>>();
@@ -526,29 +638,50 @@ namespace ScalableMssqlApi.Controllers
              }
 
              if (!string.IsNullOrWhiteSpace(search)) {
-                 var term = "%" + search + "%";
-                 // Search Description, Location, Name
-                 whereArr += " AND (charge LIKE @Search OR location LIKE @Search OR name LIKE @Search)";
-                 whereCad += " AND (nature LIKE @Search OR address LIKE @Search OR agency LIKE @Search)";
-                 whereSex += " AND (first_name LIKE @Search OR last_name LIKE @Search OR address_line_1 LIKE @Search)";
+                 var term = search;
+                 // FREETEXT(*, @Search) natively interrogates all Full-Text Indexed columns in the tables 
+                 // parsing semantic stems, plurals, and fuzzy concepts instantly without scanning.
+                 whereArr += " AND FREETEXT(*, @Search)";
+                 whereCad += " AND FREETEXT(*, @Search)";
+                 whereSex += " AND FREETEXT(*, @Search)";
                  parameters.Add("@Search", term);
+             }
+
+             // Bounding Box Spatial Filter (~69.1 miles per degree latitude)
+             if (lat.HasValue && lon.HasValue) {
+                 double milesPerDegreeLat = 69.1;
+                 double milesPerDegreeLon = milesPerDegreeLat * Math.Cos(lat.Value * Math.PI / 180.0);
+                 if (milesPerDegreeLon < 0.01) milesPerDegreeLon = 0.01; // Avoid divide by zero
+                 
+                 double deltaLat = radiusMiles / milesPerDegreeLat;
+                 double deltaLon = radiusMiles / milesPerDegreeLon;
+
+                 whereArr += " AND TRY_CAST(lat as float) BETWEEN @MinLat AND @MaxLat AND TRY_CAST(lon as float) BETWEEN @MinLon AND @MaxLon";
+                 whereCad += " AND TRY_CAST(lat as float) BETWEEN @MinLat AND @MaxLat AND TRY_CAST(lon as float) BETWEEN @MinLon AND @MaxLon";
+                 whereSex += " AND TRY_CAST(lat as float) BETWEEN @MinLat AND @MaxLat AND TRY_CAST(lon as float) BETWEEN @MinLon AND @MaxLon";
+
+                 parameters.Add("@MinLat", lat.Value - deltaLat);
+                 parameters.Add("@MaxLat", lat.Value + deltaLat);
+                 parameters.Add("@MinLon", lon.Value - deltaLon);
+                 parameters.Add("@MaxLon", lon.Value + deltaLon);
              }
 
              // Unified Query
              // Aliases: ID, EventTime, Description, Location, PrimaryPerson, SourceType, Lat, Lon
 
              var sql = $@"
-                 SELECT ID, EventTime, Description, Location, PrimaryPerson, SourceType, Lat, Lon 
+                 SELECT ID, EventTime, CloseTime, Description, Location, PrimaryPerson, SourceType, Lat, Lon 
                  FROM (
                      SELECT 
-                        CAST(id as varchar(50)) as ID, 
+                        CAST(row_hash as varchar(128)) as ID, 
                         event_time as EventTime, 
+                        NULL as CloseTime,
                         charge as Description, 
                         location as Location, 
                         name as PrimaryPerson, 
                         [key] as SourceType, 
-                        TRY_CAST(geox as float) as Lat, 
-                        TRY_CAST(geoy as float) as Lon
+                        TRY_CAST(lat as float) as Lat, 
+                        TRY_CAST(lon as float) as Lon
                      FROM dbo.DailyBulletinArrests WITH (NOLOCK)
                      WHERE {whereArr}
                      
@@ -557,12 +690,13 @@ namespace ScalableMssqlApi.Controllers
                      SELECT 
                         CAST(id as varchar(50)) as ID, 
                         starttime as EventTime, 
+                        closetime as CloseTime,
                         nature as Description, 
                         address as Location, 
                         agency as PrimaryPerson, 
                         'CAD' as SourceType, 
-                        TRY_CAST(geox as float) as Lat, 
-                        TRY_CAST(geoy as float) as Lon
+                        TRY_CAST(lat as float) as Lat, 
+                        TRY_CAST(lon as float) as Lon
                      FROM dbo.cadHandler WITH (NOLOCK)
                      WHERE {whereCad}
 
@@ -571,6 +705,7 @@ namespace ScalableMssqlApi.Controllers
                      SELECT 
                          CAST(registrant_id as varchar(50)) as ID,
                          last_changed as EventTime,
+                         NULL as CloseTime,
                          'Registered Sex Offender' as Description,
                          ISNULL(address_line_1, '') + ' ' + ISNULL(city, '') as Location,
                          first_name + ' ' + last_name as PrimaryPerson,
@@ -896,9 +1031,28 @@ namespace ScalableMssqlApi.Controllers
         {
             var offset = (page - 1) * limit;
             var sql = @"
-                SELECT ArrestRecordName as name, ArrestCharge as details, OriginalOffenses, DocOffenderNumber as OffenderNumbers, 
-                       ArrestDate as event_time, ArrestDate as date, ArrestLocation as location, JailBookId, JailBondAmount, JailCharges, JailArrestDate, JailReleasedDate
+                SELECT A.ArrestRecordName as name, A.ArrestCharge as details, A.OriginalOffenses, A.DocOffenderNumber as OffenderNumbers, 
+                       A.ArrestDate as event_time, A.ArrestDate as date, A.ArrestLocation as location, A.JailBondAmount, A.TDD_SDD,
+                       JP.photo_data
                 FROM vw_ViolatorsWithJailInfo A
+                OUTER APPLY (
+                    SELECT TOP 1 p.photo_data
+                    FROM jail_inmates i WITH (NOLOCK)
+                    JOIN jail_photos p WITH (NOLOCK) ON p.book_id = i.book_id
+                    WHERE UPPER(i.lastname) = UPPER(LTRIM(RTRIM(LEFT(A.ArrestRecordName, CHARINDEX(',', A.ArrestRecordName + ',') - 1))))
+                      AND UPPER(i.firstname) LIKE UPPER(LTRIM(RTRIM(
+                            LEFT(
+                                SUBSTRING(A.ArrestRecordName, CHARINDEX(',', A.ArrestRecordName) + 2, 100),
+                                CASE 
+                                    WHEN CHARINDEX(' ', LTRIM(SUBSTRING(A.ArrestRecordName, CHARINDEX(',', A.ArrestRecordName) + 2, 100))) > 0
+                                    THEN CHARINDEX(' ', LTRIM(SUBSTRING(A.ArrestRecordName, CHARINDEX(',', A.ArrestRecordName) + 2, 100))) - 1
+                                    ELSE LEN(SUBSTRING(A.ArrestRecordName, CHARINDEX(',', A.ArrestRecordName) + 2, 100))
+                                END
+                            )
+                          ))) + '%'
+                      AND p.photo_data IS NOT NULL
+                    ORDER BY i.arrest_date DESC
+                ) JP
                 WHERE 1=1";
             
             var parameters = new Dictionary<string, object> { { "@Limit", limit }, { "@Offset", offset } };

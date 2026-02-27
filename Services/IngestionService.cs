@@ -36,9 +36,9 @@ namespace ScalableMssqlApi.Services
             var insertedIds = new List<string>();
             int skipped = 0;
 
-            // 1. Pre-process incoming data
-            // Since DTO.id now reliably contains the computed MD5 (row_hash) and serves as the absolute PK, we only need to query on it.
+            // Pre-process incoming data - collect both rowHashes and raw site_ids
             var incomingRowHashes = reports.Select(r => r.id).Distinct().ToList();
+            var incomingSiteIds = reports.Select(r => r.site_id).Where(sid => !string.IsNullOrEmpty(sid)).Distinct().ToList();
             
             using var conn = new SqlConnection(_connectionString);
             await conn.OpenAsync();
@@ -46,28 +46,49 @@ namespace ScalableMssqlApi.Services
 
             try 
             {
-                var existingHashes = (await conn.QueryAsync<string>(
-                    "SELECT row_hash FROM DailyBulletinArrests WHERE row_hash IN @ids", 
-                    new { ids = incomingRowHashes }, 
+                // Pull both exact hash matches AND records sharing the same raw site_id to execute deep logical comparisons
+                var existingRecords = (await conn.QueryAsync(
+                    "SELECT row_hash, site_id, name, time, [key] FROM DailyBulletinArrests WHERE row_hash IN @hashes OR site_id IN @siteIds", 
+                    new { hashes = incomingRowHashes, siteIds = incomingSiteIds }, 
                     transaction: tran
-                )).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                )).ToList();
 
+                var existingHashes = existingRecords.Select(r => (string)r.row_hash).ToHashSet(StringComparer.OrdinalIgnoreCase);
                 var toInsert = new List<DailyBulletinDto>();
 
                 foreach (var r in reports)
                 {
                     var incomingHash = r.id?.Trim().ToUpper() ?? "";
 
+                    // Fast Path Check: Exact Hash Match
                     if (existingHashes.Contains(incomingHash))
                     {
                          skipped++;
+                         continue;
                     } 
-                    else 
+                    
+                    // Deep Logical Check: Does this record exist under a slightly mutated hash?
+                    var potentialLogicalDupes = existingRecords.Where(record => string.Equals((string)record.site_id, r.site_id, StringComparison.OrdinalIgnoreCase));
+                    bool isLogicalDuplicate = false;
+                    foreach (var potentialDupe in potentialLogicalDupes)
                     {
-                        toInsert.Add(r);
-                        insertedIds.Add(r.id);
-                        existingHashes.Add(incomingHash); // prevent in-batch dupes
+                        if (IsSame(potentialDupe, r))
+                        {
+                            isLogicalDuplicate = true;
+                            break;
+                        }
                     }
+
+                    if (isLogicalDuplicate)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    // Record is genuinely new
+                    toInsert.Add(r);
+                    insertedIds.Add(r.id);
+                    existingHashes.Add(incomingHash); // prevent in-batch dupes
                 }
 
                 // 2. Bulk Insert using SqlBulkCopy
